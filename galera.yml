@@ -1,0 +1,215 @@
+- name: Configurar cluster Galera MariaDB
+  hosts: galera_cluster
+  become: true
+
+  vars:
+    mysql_root_password: "root123"
+
+    galera_cluster_name: "galera_cluster"
+    galera_nodes:
+      - 192.168.100.11
+      - 192.168.100.12
+      - 192.168.100.13
+    virtual_ip: 192.168.100.100 
+
+  tasks:
+
+    - name: Actualizar paquetes
+      apt:
+        update_cache: yes
+
+    - name: Instalar MariaDB y Galera
+      apt:
+        name:
+          - mariadb-server
+          - galera-4
+          - rsync
+          - python3-pymysql
+          - keepalived
+          - haproxy
+        state: present
+
+    - name: Detener MariaDB antes de configurar
+      service:
+        name: mariadb
+        state: stopped
+
+    - name: Configurar archivo Galera
+      copy:
+        dest: /etc/mysql/mariadb.conf.d/60-galera.cnf
+        content: |
+          [mysqld]
+          bind-address=0.0.0.0
+
+          binlog_format=row
+          default_storage_engine=InnoDB
+          innodb_autoinc_lock_mode=2
+
+          wsrep_on=ON
+          wsrep_provider=/usr/lib/galera/libgalera_smm.so
+
+          wsrep_cluster_name="{{ galera_cluster_name }}"
+          wsrep_cluster_address="gcomm://192.168.100.11,192.168.100.12,192.168.100.13"
+
+          wsrep_node_address="{{ ansible_host }}"
+          wsrep_node_name="{{ inventory_hostname }}"
+
+          wsrep_sst_method=rsync
+          wsrep_sst_auth="root:{{ mysql_root_password }}"
+
+          wsrep_provider_options="gmcast.listen_addr=tcp://0.0.0.0:4567"
+
+    - name: Eliminar datadir completo (solo db1)
+      file:
+        path: /var/lib/mysql
+        state: absent
+      when: inventory_hostname == "db1"
+
+    - name: Recrear datadir
+      file:
+        path: /var/lib/mysql
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0755'
+      when: inventory_hostname == "db1"
+
+    - name: Inicializar base de datos MariaDB (solo db1)
+      command: mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+      when: inventory_hostname == "db1"
+
+    - name: Inicializar cluster en nodo primario (db1)
+      command: galera_new_cluster
+      when: inventory_hostname == "db1"
+
+    - name: Esperar a que el nodo primario esté listo
+      wait_for:
+        port: 3306
+        host: "{{ ansible_host }}"
+        delay: 5
+        timeout: 60
+      when: inventory_hostname == "db1"
+
+    - name: Iniciar MariaDB en nodos secundarios
+      service:
+        name: mariadb
+        state: started
+      when: inventory_hostname != "db1"
+
+    - name: Asegurar MariaDB activo
+      service:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Esperar puerto MySQL en todos los nodos
+      wait_for:
+        port: 3306
+        host: "{{ ansible_host }}"
+        delay: 5
+        timeout: 60
+
+    - name: Configurar password root (solo una vez en db1)
+      mysql_user:
+        name: root
+        host: localhost
+        password: "{{ mysql_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        check_implicit_admin: true
+        state: present
+      when: inventory_hostname == "db1"
+    
+    - name: Crear usuario remoto (solo db1)
+      mysql_user:
+        name: root
+        host: "%"
+        password: "{{ mysql_root_password }}"
+        priv: "*.*:ALL,GRANT"
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      when: inventory_hostname == "db1"
+
+
+#################################################################
+# KEEPALIVED (3 NODOS)
+#################################################################
+
+    - name: Configurar keepalived en todos los nodos
+      copy:
+        dest: /etc/keepalived/keepalived.conf
+        content: |
+          vrrp_instance VI_1 {
+              state BACKUP
+              interface ens3
+              virtual_router_id 51
+              priority {{ 
+                100 if inventory_hostname == 'db1' else
+                90 if inventory_hostname == 'db2' else
+                80 
+              }}
+              advert_int 1
+
+              authentication {
+                  auth_type PASS
+                  auth_pass prueba123
+              }
+
+              virtual_ipaddress {
+                  {{ virtual_ip }}
+              }
+          }
+
+    - name: Reiniciar keepalived
+      service:
+        name: keepalived
+        state: restarted
+        enabled: true
+
+#################################################################
+# HAPROXY
+#################################################################
+
+    - name: Configurar HAProxy
+      copy:
+        dest: /etc/haproxy/haproxy.cfg
+        content: |
+          global
+              log /dev/log local0
+              log /dev/log local1 notice
+              daemon
+
+          defaults
+              log     global
+              mode    tcp
+              option  dontlognull
+              timeout connect 1s
+              timeout client  10s
+              timeout server  10s
+
+          frontend mysql_front
+              bind *:3307
+              default_backend galera_backend
+
+          backend galera_backend
+              balance roundrobin
+              option tcp-check
+
+              server db1 192.168.100.11:3306 check
+              server db2 192.168.100.12:3306 check
+              server db3 192.168.100.13:3306 check
+
+    - name: Habilitar HAProxy en /etc/default/haproxy
+      lineinfile:
+        path: /etc/default/haproxy
+        regexp: '^ENABLED='
+        line: 'ENABLED=1'
+
+    - name: Validar configuración HAProxy
+      command: haproxy -c -f /etc/haproxy/haproxy.cfg
+
+    - name: Reiniciar HAProxy
+      service:
+        name: haproxy
+        state: restarted
+        enabled: true
